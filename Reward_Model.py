@@ -13,16 +13,19 @@ TODO:
 '''
 
 # Determines what DEVICE the neural network will function on in your computer
+# Apple Silicon has "mps", which has a GPU
 DEVICE = "cpu"
 if torch.cuda.is_available(): DEVICE = "cuda"
-# Apple Silicon has "mps", which has a GPU
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): DEVICE = "mps"
+
+torch.set_default_dtype(torch.float16)
 
 class WardMod(nn.Module):
 
-    def __init__(self, init_neurons = 5, neuron_l1 = 16, neuron_l2 = 8, output = 5):
+    def __init__(self, init_neurons = 10, neuron_l1 = 4, neuron_l2 = 4, output = 10):
         # instantiate nn.Module to minimize errors
         super(WardMod, self).__init__()
+
         # construct the neural network; GELU(approximate='none') is ideal for our Linear Regression
         self.fc1 = nn.Linear(init_neurons, neuron_l1)
         self.GELU = nn.GELU(approximate='none')
@@ -60,44 +63,48 @@ class WardMod(nn.Module):
 # We won't be needing this when we use it to train our AI.
 torch.manual_seed(41)
 
-# Let x equal 10 different responses, for now
-x = 10
 
 # instantiate; Note that what's given is a dummy input
 NN_model = WardMod().to(DEVICE) 
-init_input = torch.tensor([ 
-    [2.0, 4.0, 6.0, 8.0, 10.0], 
-    [9.0, 8.0, 5.0, 3.0, 1.0], 
-    [2.0, 5.0, 3.0, 8.0, 10.0], 
-    [9.0, 6.0, 7.0, 2.0, 3.0], 
-    [1.0, 7.0, 5.0, 3.0, 9.0], 
-    [3.0, 1.0, 10.0, 4.0, 2.0], 
-    [9.0, 8.0, 5.0, 2.0, 3.0], 
-    [1.0, 10.0, 7.0, 4.0, 2.0], 
-    [4.0, 6.0, 10.0, 9.0, 2.0], 
-    [5.0, 1.0, 9.0, 2.0, 4.0] ] , device = DEVICE) 
-result = NN_model(init_input)
-optimizer = NN_model.config_optim(device = DEVICE)
-# For now, simulate 100 tries
+
+def load_batch(file, batch_size):
+    temp_data = []
+    with open(file, "r") as f:
+        for line in f:
+            # Convert to int8
+            temp_data.append([int(x) for x in line.split()])
+            if len(temp_data) >= batch_size:
+                # We yield this output to save on memory
+                yield torch.tensor(temp_data, device=DEVICE, dtype=torch.int8)
+                temp_data = []
+    if temp_data:
+        yield torch.tensor(temp_data, device= DEVICE, dtype=torch.int8)
+
+
+# Required to complete the matrix multiplication
+with torch.autocast(device_type = DEVICE, dtype=torch.float32):
+    optimizer = NN_model.config_optim(device = DEVICE)
+
+def process_data_batch(batch):
+    batch_float = batch.to(torch.float16)
+
+    # Apply processes to batch, and determine target values to test against
+    mean = batch_float.mean(dim = 0, keepdim = True)
+    std_dev = batch_float.std(dim = 0, keepdim = True) + 1e-5
+    normalized_batch = (batch_float - mean) / std_dev
+    target_batch = normalized_batch.div(10)
+
+    return normalized_batch, target_batch
+
 # Don't ask, this is a random 2^N power that had to be small
+batch_size = 1024
 grad_accum_steps = 4
 
 for i in range(100):
 
     # Check how long it takes to complete 1 step in the total training process
     t_i = time.time()
-    # The desired answer (The answer is supposed to rank human preferences)
-    actual_answer = torch.tensor( [
-        [0.1, 0.3, 0.5, 0.7, 0.9], 
-        [0.9, 0.7, 0.4, 0.2, 0.0], 
-        [0.1, 0.4, 0.2, 0.7, 0.9], 
-        [0.8, 0.5, 0.6, 0.1, 0.2], 
-        [0.0, 0.6, 0.4, 0.2, 0.8], 
-        [0.2, 0.0, 0.9, 0.3, 0.1], 
-        [0.8, 0.7, 0.4, 0.1, 0.2], 
-        [0.0, 0.9, 0.6, 0.3, 0.1], 
-        [0.3, 0.5, 0.9, 0.8, 0.1], 
-        [0.4, 0.0, 0.8, 0.1, 0.3]], device = DEVICE)
+
     criteria = nn.MSELoss()
     
     # train the NN_model and zero gradients as .backward() uses a += operator on them
@@ -107,11 +114,12 @@ for i in range(100):
     # Reset
     loss_accum = 0.0
     
-    # Execute forwards and backwards (backpropagation) passes 4 times
-    for sub_i in range(grad_accum_steps):
-        # move tensors to DEVICE, convert to bfloat 16, and determine mean of the loss
-        init_input, actual_answer = init_input.to(DEVICE), actual_answer.to(DEVICE)
-        with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
+    # Splits our 36 million tensors into manageable batches
+    for index,batch in enumerate(load_batch("guesses.txt",batch_size)):
+        
+        # determine mean of the loss
+        init_input, actual_answer = process_data_batch(batch)
+        with torch.autocast(device_type=DEVICE, dtype=torch.float32):
             result = NN_model(init_input)
             loss = criteria(result, actual_answer)
         
@@ -137,5 +145,6 @@ for i in range(100):
 
 
 '''
-Experiment: Neural Network gets ~75% accuracy after 100 tries, but gets 99.999993% accuracy after 10000 tries
+Experiment: Neural Network gets ~75% accuracy after 100 tries, but gets 99.999993% accuracy after 10000 tries on 10 fixed datasets
+Neural Network plateaus at 99.954180-99.954184% accuracy when given the guesses.txt model (which has 36 million rankings of 1-10)
 '''
